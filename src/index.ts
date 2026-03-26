@@ -23,6 +23,24 @@ const app = new Hono<{ Bindings: Env }>();
 
 app.use('*', cors({ origin: '*', allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'] }));
 
+// Auth middleware — protect write endpoints, allow public reads
+app.use('*', async (c, next) => {
+  const method = c.req.method;
+  const path = c.req.path;
+
+  // Allow OPTIONS, GET, and health/status
+  if (method === 'OPTIONS' || method === 'GET' || path === '/health' || path === '/status') {
+    return next();
+  }
+
+  // All write ops require API key
+  const key = c.req.header('X-Echo-API-Key') ?? c.req.header('Authorization')?.replace('Bearer ', '');
+  if (!key || key !== c.env.ECHO_API_KEY) {
+    return c.json({ error: 'Unauthorized', message: 'Valid API key required for write operations' }, 401);
+  }
+  return next();
+});
+
 // ---------------------------------------------------------------------------
 // Schema init
 // ---------------------------------------------------------------------------
