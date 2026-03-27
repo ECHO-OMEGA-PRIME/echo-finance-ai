@@ -45,6 +45,13 @@ app.use('*', async (c, next) => {
 // Schema init
 // ---------------------------------------------------------------------------
 
+// CORS headers (auto-added by Evolution Engine)
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Echo-API-Key',
+};
+
 async function initSchema(db: D1Database) {
   await db.batch([
     // Accounts (bank, credit card, brokerage, crypto wallet, cash)
