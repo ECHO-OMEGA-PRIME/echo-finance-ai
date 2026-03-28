@@ -34,6 +34,20 @@ app.use('*', async (c, next) => {
 
 app.use('*', cors({ origin: '*', allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'] }));
 
+// Rate limiting — 120 req/min per IP on write methods
+app.use('*', async (c, next) => {
+  if (c.req.method === 'POST' || c.req.method === 'PUT' || c.req.method === 'DELETE') {
+    const ip = c.req.header('CF-Connecting-IP') || 'unknown';
+    const key = `rl:${ip}:${Math.floor(Date.now() / 60000)}`;
+    const count = parseInt(await c.env.CACHE.get(key) || '0');
+    if (count >= 120) {
+      return c.json({ error: 'Rate limit exceeded', retry_after: 60 }, 429);
+    }
+    await c.env.CACHE.put(key, String(count + 1), { expirationTtl: 120 });
+  }
+  return next();
+});
+
 // Auth middleware — protect write endpoints, allow public reads
 app.use('*', async (c, next) => {
   const method = c.req.method;
