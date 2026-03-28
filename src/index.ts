@@ -350,22 +350,27 @@ app.post('/transactions', async (c) => {
     merchant?: string; is_recurring?: boolean; tags?: string[]; notes?: string;
   }>();
   const id = uid();
-  await c.env.DB.prepare(
-    `INSERT INTO transactions (id, account_id, date, amount, type, category, subcategory, description, merchant, is_recurring, tags, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(
-    id, body.account_id, body.date, body.amount, body.type,
-    body.category ?? null, body.subcategory ?? null, body.description ?? null,
-    body.merchant ?? null, body.is_recurring ? 1 : 0,
-    JSON.stringify(body.tags ?? []), body.notes ?? null
-  ).run();
+  // Batch insert + balance update atomically to prevent race conditions
+  const stmts: D1PreparedStatement[] = [
+    c.env.DB.prepare(
+      `INSERT INTO transactions (id, account_id, date, amount, type, category, subcategory, description, merchant, is_recurring, tags, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      id, body.account_id, body.date, body.amount, body.type,
+      body.category ?? null, body.subcategory ?? null, body.description ?? null,
+      body.merchant ?? null, body.is_recurring ? 1 : 0,
+      JSON.stringify(body.tags ?? []), body.notes ?? null
+    ),
+  ];
 
-  // Update account balance
+  // Update account balance atomically within the same batch
   if (body.type === 'income' || body.type === 'deposit') {
-    await c.env.DB.prepare('UPDATE accounts SET balance = balance + ?, updated_at = datetime(\'now\') WHERE id = ?').bind(body.amount, body.account_id).run();
+    stmts.push(c.env.DB.prepare('UPDATE accounts SET balance = balance + ?, updated_at = datetime(\'now\') WHERE id = ?').bind(body.amount, body.account_id));
   } else if (body.type === 'expense' || body.type === 'withdrawal') {
-    await c.env.DB.prepare('UPDATE accounts SET balance = balance - ?, updated_at = datetime(\'now\') WHERE id = ?').bind(body.amount, body.account_id).run();
+    stmts.push(c.env.DB.prepare('UPDATE accounts SET balance = balance - ?, updated_at = datetime(\'now\') WHERE id = ?').bind(body.amount, body.account_id));
   }
+
+  await c.env.DB.batch(stmts);
 
   return c.json({ id, created: true }, 201);
 });
@@ -379,7 +384,20 @@ app.get('/transactions/:id', async (c) => {
 
 app.delete('/transactions/:id', async (c) => {
   await initSchema(c.env.DB);
-  await c.env.DB.prepare('DELETE FROM transactions WHERE id = ?').bind(c.req.param('id')).run();
+  // Read transaction first to reverse the balance effect
+  const txn = await c.env.DB.prepare('SELECT * FROM transactions WHERE id = ?').bind(c.req.param('id')).first<{ id: string; account_id: string; amount: number; type: string }>();
+  if (!txn) return c.json({ error: 'Not found' }, 404);
+
+  // Batch delete + balance reversal atomically
+  const stmts: D1PreparedStatement[] = [
+    c.env.DB.prepare('DELETE FROM transactions WHERE id = ?').bind(c.req.param('id')),
+  ];
+  if (txn.type === 'income' || txn.type === 'deposit') {
+    stmts.push(c.env.DB.prepare('UPDATE accounts SET balance = balance - ?, updated_at = datetime(\'now\') WHERE id = ?').bind(txn.amount, txn.account_id));
+  } else if (txn.type === 'expense' || txn.type === 'withdrawal') {
+    stmts.push(c.env.DB.prepare('UPDATE accounts SET balance = balance + ?, updated_at = datetime(\'now\') WHERE id = ?').bind(txn.amount, txn.account_id));
+  }
+  await c.env.DB.batch(stmts);
   return c.json({ deleted: true });
 });
 
