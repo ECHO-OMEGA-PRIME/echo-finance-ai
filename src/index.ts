@@ -17,6 +17,9 @@ interface Env {
   SHARED_BRAIN: Fetcher;
   WORKER_VERSION: string;
   ECHO_API_KEY: string;
+  STRIPE_SECRET_KEY: string;
+  STRIPE_WEBHOOK_SECRET: string;
+  ANALYTICS: AnalyticsEngineDataset;
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -34,9 +37,9 @@ app.use('*', async (c, next) => {
 
 app.use('*', cors({ origin: ['https://echo-ept.com','https://www.echo-ept.com','https://echo-op.com','https://www.echo-op.com','http://localhost:3000','http://localhost:3001'], allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], allowHeaders: ['Content-Type','Authorization','X-Echo-API-Key'] }));
 
-// Rate limiting — 120 req/min per IP on write methods
+// Rate limiting — 120 req/min per IP on write methods (exempt webhook)
 app.use('*', async (c, next) => {
-  if (c.req.method === 'POST' || c.req.method === 'PUT' || c.req.method === 'DELETE') {
+  if ((c.req.method === 'POST' || c.req.method === 'PUT' || c.req.method === 'DELETE') && c.req.path !== '/webhooks/stripe') {
     const ip = c.req.header('CF-Connecting-IP') || 'unknown';
     const key = `rl:${ip}:${Math.floor(Date.now() / 60000)}`;
     const count = parseInt(await c.env.CACHE.get(key) || '0');
@@ -53,8 +56,8 @@ app.use('*', async (c, next) => {
   const method = c.req.method;
   const path = c.req.path;
 
-  // Allow OPTIONS, GET, and health/status
-  if (method === 'OPTIONS' || method === 'GET' || path === '/health' || path === '/status') {
+  // Allow OPTIONS, GET, health/status, and Stripe webhook
+  if (method === 'OPTIONS' || method === 'GET' || path === '/health' || path === '/status' || path === '/webhooks/stripe') {
     return next();
   }
 
@@ -240,7 +243,7 @@ function json(data: unknown, status = 200) {
 }
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
-  const entry = { ts: new Date().toISOString(), level, worker: 'echo-finance-ai', version: '1.0.0', msg, ...data };
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-finance-ai', version: '2.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
 }
@@ -249,13 +252,51 @@ function now(): string {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
+// ═══════════════ SUBSCRIPTION PLANS ═══════════════
+
+const FINANCE_PLANS = [
+  { id: 'free', name: 'Free', price: 0, max_portfolios: 1, max_alerts: 5, ai_queries: 10 },
+  { id: 'pro', name: 'Pro', price: 2999, max_portfolios: 10, max_alerts: 50, ai_queries: 500, display: '$29.99/mo' },
+  { id: 'premium', name: 'Premium', price: 9999, max_portfolios: 50, max_alerts: 250, ai_queries: 2000, display: '$99.99/mo' },
+  { id: 'enterprise', name: 'Enterprise', price: 29999, max_portfolios: -1, max_alerts: -1, ai_queries: -1, display: '$299.99/mo' },
+] as const;
+
+// ═══════════════ STRIPE VERIFICATION ═══════════════
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  const parts: Record<string, string> = {};
+  for (const p of sigHeader.split(',')) { const eq = p.indexOf('='); if (eq > 0) parts[p.slice(0, eq).trim()] = p.slice(eq + 1).trim(); }
+  const ts = parts['t']; const v1 = parts['v1'];
+  if (!ts || !v1) return false;
+  if (Math.abs(Date.now() / 1000 - parseInt(ts)) > 300) return false;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${ts}.${payload}`));
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (expected.length !== v1.length) return false;
+  let diff = 0; for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ v1.charCodeAt(i);
+  return diff === 0;
+}
+
+async function stripeRequest(env: Env, method: string, endpoint: string, params?: Record<string, string>): Promise<any> {
+  const url = `https://api.stripe.com/v1${endpoint}`;
+  const opts: RequestInit = {
+    method,
+    headers: {
+      'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  };
+  if (params) opts.body = new URLSearchParams(params).toString();
+  const resp = await fetch(url, opts);
+  return resp.json();
+}
+
 // ---------------------------------------------------------------------------
 // Root, Health & Status
 // ---------------------------------------------------------------------------
 
-app.get('/', (c) => c.json({ service: 'echo-finance-ai', version: '1.0.0', status: 'operational' }));
+app.get('/', (c) => c.json({ service: 'echo-finance-ai', version: '2.0.0', status: 'operational' }));
 
-app.get('/health', (c) => c.json({ status: 'healthy', service: 'echo-finance-ai', version: c.env.WORKER_VERSION, timestamp: now() }));
+app.get('/health', (c) => c.json({ status: 'healthy', service: 'echo-finance-ai', version: '2.0.0', timestamp: now(), stripe: c.env.STRIPE_SECRET_KEY ? 'configured' : 'not_configured' }));
 
 app.get('/status', async (c) => {
   await initSchema(c.env.DB);
@@ -1036,6 +1077,265 @@ async function handleCron(env: Env, trigger: string) {
     } catch (_) { /* best effort */ }
   }
 }
+
+// ---------------------------------------------------------------------------
+// STRIPE WEBHOOK
+// ---------------------------------------------------------------------------
+
+app.post('/webhooks/stripe', async (c) => {
+  const sigHeader = c.req.header('stripe-signature') || '';
+  const body = await c.req.text();
+  if (!await verifyStripeSignature(body, sigHeader, c.env.STRIPE_WEBHOOK_SECRET)) {
+    slog('warn', 'stripe_webhook_signature_failed');
+    return c.json({ error: 'Invalid signature' }, 401);
+  }
+  const event = JSON.parse(body);
+  slog('info', 'stripe_webhook_received', { type: event.type, id: event.id });
+  await initSchema(c.env.DB);
+  try {
+    // Ensure stripe_payments table exists
+    await c.env.DB.prepare(`CREATE TABLE IF NOT EXISTS stripe_payments (
+      id TEXT PRIMARY KEY,
+      stripe_id TEXT UNIQUE,
+      amount REAL NOT NULL,
+      currency TEXT DEFAULT 'usd',
+      status TEXT DEFAULT 'pending',
+      payment_type TEXT DEFAULT 'service_billing',
+      payment_method TEXT DEFAULT 'card',
+      customer_email TEXT,
+      description TEXT,
+      failure_reason TEXT,
+      metadata TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )`).run();
+
+    switch (event.type) {
+      case 'payment_intent.succeeded': {
+        const pi = event.data.object;
+        const id = uid();
+        await c.env.DB.prepare("INSERT INTO stripe_payments (id,stripe_id,amount,currency,status,payment_type,payment_method,customer_email,description,metadata,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))").bind(
+          id, pi.id, pi.amount / 100, pi.currency, 'succeeded',
+          pi.metadata?.type || 'service_billing', 'card',
+          pi.receipt_email || pi.metadata?.email || null,
+          pi.description || null, JSON.stringify(pi.metadata || {})
+        ).run();
+        // If linked to a subscription, record income transaction
+        if (pi.metadata?.record_transaction === 'true') {
+          const txId = uid();
+          await c.env.DB.prepare("INSERT INTO transactions (id, account_id, date, amount, type, category, description, merchant) VALUES (?, ?, date('now'), ?, 'income', 'service_revenue', ?, 'Stripe')").bind(
+            txId, pi.metadata?.account_id || null, pi.amount / 100, pi.description || 'Service payment'
+          ).run();
+        }
+        break;
+      }
+      case 'payment_intent.payment_failed': {
+        const pi = event.data.object;
+        const id = uid();
+        await c.env.DB.prepare("INSERT INTO stripe_payments (id,stripe_id,amount,currency,status,payment_type,payment_method,customer_email,failure_reason,metadata,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))").bind(
+          id, pi.id, pi.amount / 100, pi.currency, 'failed',
+          pi.metadata?.type || 'service_billing', 'card',
+          pi.receipt_email || null,
+          pi.last_payment_error?.message || 'Unknown',
+          JSON.stringify(pi.metadata || {})
+        ).run();
+        break;
+      }
+      case 'charge.refunded': {
+        const charge = event.data.object;
+        await c.env.DB.prepare("UPDATE stripe_payments SET status='refunded',updated_at=datetime('now') WHERE stripe_id=?").bind(charge.payment_intent).run();
+        break;
+      }
+      case 'invoice.paid': {
+        const invoice = event.data.object;
+        const id = uid();
+        await c.env.DB.prepare("INSERT INTO stripe_payments (id,stripe_id,amount,currency,status,payment_type,payment_method,customer_email,description,metadata,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))").bind(
+          id, invoice.id, invoice.amount_paid / 100, invoice.currency, 'succeeded',
+          'subscription', 'card', invoice.customer_email || null,
+          `Invoice ${invoice.number || invoice.id}`, JSON.stringify({ subscription: invoice.subscription })
+        ).run();
+        break;
+      }
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        if (session.mode === 'subscription') {
+          const email = session.customer_email || session.customer_details?.email || null;
+          const planMeta = session.metadata?.plan_id || 'pro';
+          const plan = FINANCE_PLANS.find(p => p.id === planMeta) || FINANCE_PLANS[1];
+          // Ensure user_subscriptions table
+          await c.env.DB.prepare(`CREATE TABLE IF NOT EXISTS user_subscriptions (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            plan_id TEXT NOT NULL DEFAULT 'free',
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            max_portfolios INTEGER DEFAULT 1,
+            max_alerts INTEGER DEFAULT 5,
+            ai_queries INTEGER DEFAULT 10,
+            status TEXT DEFAULT 'active',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+          )`).run();
+          if (email) {
+            // Upsert: update if exists, insert if not
+            const existing = await c.env.DB.prepare('SELECT id FROM user_subscriptions WHERE email = ?').bind(email).first();
+            if (existing) {
+              await c.env.DB.prepare("UPDATE user_subscriptions SET plan_id=?, stripe_customer_id=?, stripe_subscription_id=?, max_portfolios=?, max_alerts=?, ai_queries=?, status='active', updated_at=datetime('now') WHERE email=?").bind(
+                plan.id, session.customer || null, session.subscription || null,
+                plan.max_portfolios, plan.max_alerts, plan.ai_queries, email
+              ).run();
+            } else {
+              await c.env.DB.prepare("INSERT INTO user_subscriptions (id, email, plan_id, stripe_customer_id, stripe_subscription_id, max_portfolios, max_alerts, ai_queries, status) VALUES (?,?,?,?,?,?,?,?,?)").bind(
+                uid(), email, plan.id, session.customer || null, session.subscription || null,
+                plan.max_portfolios, plan.max_alerts, plan.ai_queries, 'active'
+              ).run();
+            }
+            slog('info', 'subscription_activated', { email, plan: plan.id });
+          }
+          // Also record payment
+          const payId = uid();
+          await c.env.DB.prepare("INSERT INTO stripe_payments (id,stripe_id,amount,currency,status,payment_type,customer_email,description,metadata,created_at) VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))").bind(
+            payId, session.id, (session.amount_total || 0) / 100, session.currency || 'usd', 'succeeded',
+            'subscription', email, `Subscription: ${plan.name}`, JSON.stringify({ plan_id: plan.id, subscription: session.subscription })
+          ).run();
+        }
+        break;
+      }
+    }
+  } catch (e: any) {
+    slog('error', 'stripe_webhook_processing_error', { error: e.message, event_type: event.type });
+  }
+  return c.json({ received: true });
+});
+
+// ---------------------------------------------------------------------------
+// STRIPE PAYMENT ENDPOINTS
+// ---------------------------------------------------------------------------
+
+app.post('/stripe/create-billing', async (c) => {
+  await initSchema(c.env.DB);
+  const body = await c.req.json<{ amount: number; currency?: string; description?: string; customer_email?: string; metadata?: Record<string, string> }>();
+  if (!body.amount) return c.json({ error: 'amount required' }, 400);
+  try {
+    const params: Record<string, string> = {
+      amount: String(Math.round(body.amount * 100)),
+      currency: body.currency || 'usd',
+      description: body.description || 'Financial service billing',
+      'payment_method_types[]': 'card',
+    };
+    if (body.customer_email) params.receipt_email = body.customer_email;
+    if (body.metadata) {
+      for (const [k, v] of Object.entries(body.metadata)) params[`metadata[${k}]`] = v;
+    }
+    params['metadata[type]'] = 'service_billing';
+    const result = await stripeRequest(c.env, 'POST', '/payment_intents', params);
+    slog('info', 'stripe_billing_created', { amount: body.amount });
+    return c.json({ payment_intent: result });
+  } catch (e: any) {
+    slog('error', 'stripe_billing_failed', { error: e.message });
+    return c.json({ error: 'Billing creation failed', detail: e.message }, 500);
+  }
+});
+
+app.post('/stripe/create-subscription-checkout', async (c) => {
+  await initSchema(c.env.DB);
+  const body = await c.req.json<{ price_id: string; customer_email?: string; success_url?: string; cancel_url?: string }>();
+  if (!body.price_id) return c.json({ error: 'price_id required' }, 400);
+  try {
+    const params: Record<string, string> = {
+      'line_items[0][price]': body.price_id,
+      'line_items[0][quantity]': '1',
+      mode: 'subscription',
+      success_url: body.success_url || 'https://echo-ept.com/payments/success?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: body.cancel_url || 'https://echo-ept.com/payments/cancel',
+    };
+    if (body.customer_email) params.customer_email = body.customer_email;
+    const result = await stripeRequest(c.env, 'POST', '/checkout/sessions', params);
+    slog('info', 'stripe_checkout_session_created', { price_id: body.price_id });
+    return c.json({ checkout_session: result });
+  } catch (e: any) {
+    slog('error', 'stripe_checkout_failed', { error: e.message });
+    return c.json({ error: 'Checkout session failed', detail: e.message }, 500);
+  }
+});
+
+app.get('/stripe/payments', async (c) => {
+  await initSchema(c.env.DB);
+  try {
+    await c.env.DB.prepare(`CREATE TABLE IF NOT EXISTS stripe_payments (
+      id TEXT PRIMARY KEY, stripe_id TEXT UNIQUE, amount REAL NOT NULL, currency TEXT DEFAULT 'usd',
+      status TEXT DEFAULT 'pending', payment_type TEXT DEFAULT 'service_billing', payment_method TEXT DEFAULT 'card',
+      customer_email TEXT, description TEXT, failure_reason TEXT, metadata TEXT,
+      created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
+    )`).run();
+  } catch {}
+  const status = c.req.query('status');
+  const limit = parseInt(c.req.query('limit') ?? '50');
+  let sql = 'SELECT * FROM stripe_payments';
+  const params: unknown[] = [];
+  if (status) { sql += ' WHERE status = ?'; params.push(status); }
+  sql += ' ORDER BY created_at DESC LIMIT ?';
+  params.push(limit);
+  const rows = await c.env.DB.prepare(sql).bind(...params).all();
+  return c.json({ payments: rows.results, count: rows.results.length });
+});
+
+app.get('/stripe/revenue-summary', async (c) => {
+  await initSchema(c.env.DB);
+  try {
+    await c.env.DB.prepare(`CREATE TABLE IF NOT EXISTS stripe_payments (
+      id TEXT PRIMARY KEY, stripe_id TEXT UNIQUE, amount REAL NOT NULL, currency TEXT DEFAULT 'usd',
+      status TEXT DEFAULT 'pending', payment_type TEXT DEFAULT 'service_billing', payment_method TEXT DEFAULT 'card',
+      customer_email TEXT, description TEXT, failure_reason TEXT, metadata TEXT,
+      created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
+    )`).run();
+  } catch {}
+  const [total, monthly, byType] = await Promise.all([
+    c.env.DB.prepare("SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as count FROM stripe_payments WHERE status='succeeded'").first<{ total: number; count: number }>(),
+    c.env.DB.prepare("SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as count FROM stripe_payments WHERE status='succeeded' AND created_at >= date('now','start of month')").first<{ total: number; count: number }>(),
+    c.env.DB.prepare("SELECT payment_type, COALESCE(SUM(amount),0) as total, COUNT(*) as count FROM stripe_payments WHERE status='succeeded' GROUP BY payment_type ORDER BY total DESC").all(),
+  ]);
+  return c.json({
+    all_time: { revenue: total?.total ?? 0, transactions: total?.count ?? 0 },
+    this_month: { revenue: monthly?.total ?? 0, transactions: monthly?.count ?? 0 },
+    by_type: byType.results,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// STRIPE SCHEMA MIGRATION
+// ---------------------------------------------------------------------------
+
+app.post('/admin/migrate-stripe', async (c) => {
+  await initSchema(c.env.DB);
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare(`CREATE TABLE IF NOT EXISTS stripe_payments (
+        id TEXT PRIMARY KEY,
+        stripe_id TEXT UNIQUE,
+        amount REAL NOT NULL,
+        currency TEXT DEFAULT 'usd',
+        status TEXT DEFAULT 'pending',
+        payment_type TEXT DEFAULT 'service_billing',
+        payment_method TEXT DEFAULT 'card',
+        customer_email TEXT,
+        description TEXT,
+        failure_reason TEXT,
+        metadata TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      )`),
+      c.env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_stripe_status ON stripe_payments(status)`),
+      c.env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_stripe_type ON stripe_payments(payment_type)`),
+      c.env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_stripe_email ON stripe_payments(customer_email)`),
+    ]);
+    slog('info', 'stripe_schema_migrated');
+    return c.json({ migrated: true, tables: ['stripe_payments'] });
+  } catch (e: any) {
+    slog('error', 'stripe_migration_failed', { error: e.message });
+    return c.json({ error: 'Migration failed', detail: e.message }, 500);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Error Handlers
