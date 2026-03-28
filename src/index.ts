@@ -221,7 +221,14 @@ function uid(): string {
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' }
+
+function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-finance-ai', version: '1.0.0', msg, ...data };
+  if (level === 'error') console.error(JSON.stringify(entry));
+  else console.log(JSON.stringify(entry));
+}
+,
   });
 }
 
@@ -1005,7 +1012,7 @@ app.onError((err, c) => {
   if (err.message?.includes('JSON')) {
     return c.json({ error: 'Invalid JSON body' }, 400);
   }
-  console.error(`[echo-finance-ai] ${err.message}`);
+  slog('error', 'Unhandled request error', { error: err.message, stack: err.stack });
   return c.json({ error: 'Internal server error' }, 500);
 });
 
