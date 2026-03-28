@@ -32,7 +32,7 @@ app.use('*', async (c, next) => {
   c.header('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
 });
 
-app.use('*', cors({ origin: '*', allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'] }));
+app.use('*', cors({ origin: ['https://echo-ept.com','https://www.echo-ept.com','https://echo-op.com','https://www.echo-op.com','http://localhost:3000','http://localhost:3001'], allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], allowHeaders: ['Content-Type','Authorization','X-Echo-API-Key'] }));
 
 // Rate limiting — 120 req/min per IP on write methods
 app.use('*', async (c, next) => {
