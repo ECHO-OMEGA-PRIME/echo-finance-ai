@@ -236,8 +236,10 @@ function now(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Health & Status
+// Root, Health & Status
 // ---------------------------------------------------------------------------
+
+app.get('/', (c) => c.json({ service: 'echo-finance-ai', version: '1.0.0', status: 'operational' }));
 
 app.get('/health', (c) => c.json({ status: 'healthy', service: 'echo-finance-ai', version: c.env.WORKER_VERSION, timestamp: now() }));
 
